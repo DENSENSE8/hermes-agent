@@ -8,6 +8,7 @@ python-dotenv
 fire
 httpx
 rich
+textual
 tenacity
 prompt_toolkit
 pyyaml

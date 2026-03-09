@@ -319,7 +319,7 @@ class SendResult:
     raw_response: Any = None
 
 
-# Type for message handlers
+# Handler may return str (sent by base) or dict(content=..., already_sent=True).
 MessageHandler = Callable[[MessageEvent], Awaitable[Optional[str]]]
 
 
@@ -691,11 +691,20 @@ class BasePlatformAdapter(ABC):
         
         try:
             # Call the handler (this can take a while with tool calls)
-            response = await self._message_handler(event)
+            handler_result = await self._message_handler(event)
+
+            # Normalise: handler may return str or dict(content, already_sent)
+            already_sent = False
+            if isinstance(handler_result, dict):
+                response = handler_result.get("content") or ""
+                already_sent = handler_result.get("already_sent", False)
+            else:
+                response = handler_result
             
             # Send response if any
             if not response:
-                logger.warning("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
+                if not already_sent:
+                    logger.warning("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
@@ -706,7 +715,7 @@ class BasePlatformAdapter(ABC):
                     logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
                 
                 # Send the text portion first (if any remains after extractions)
-                if text_content:
+                if text_content and not already_sent:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     result = await self.send(
                         chat_id=event.source.chat_id,
