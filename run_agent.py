@@ -3286,9 +3286,48 @@ class AIAgent:
         return unique if len(unique) < len(tool_calls) else tool_calls
 
     def _repair_tool_call(self, tool_name: str) -> str | None:
+<<<<<<< Updated upstream
         """Forwarder — see ``agent.agent_runtime_helpers.repair_tool_call``."""
         from agent.agent_runtime_helpers import repair_tool_call
         return repair_tool_call(self, tool_name)
+=======
+        """Attempt to repair a mismatched tool name before aborting.
+
+        1. Try lowercase
+        2. Try normalized (lowercase + hyphens/spaces -> underscores)
+        3. Try fuzzy match (difflib, cutoff=0.85) with substring-overlap guard
+
+        Returns the repaired name if found in valid_tool_names, else None.
+        """
+        from difflib import get_close_matches
+
+        # 1. Lowercase
+        lowered = tool_name.lower()
+        if lowered in self.valid_tool_names:
+            return lowered
+
+        # 2. Normalize
+        normalized = lowered.replace("-", "_").replace(" ", "_")
+        if normalized in self.valid_tool_names:
+            return normalized
+
+        # 3. Fuzzy match -- tight cutoff + reject pure substring matches.
+        # A short generic name like "search" must not silently snap to a
+        # specific tool like "x_search" or "session_search" just because
+        # the literal substring overlaps; that dispatches the wrong tool
+        # with the wrong args.  Let the model self-correct instead.
+        matches = get_close_matches(lowered, self.valid_tool_names, n=1, cutoff=0.85)
+        if matches:
+            candidate = matches[0]
+            # Substring guard: if the model name appears verbatim inside the
+            # candidate (or vice versa) and the lengths differ enough that the
+            # extra characters carry real semantic meaning, refuse the repair.
+            if (lowered in candidate or candidate in lowered) and abs(len(candidate) - len(lowered)) >= 3:
+                return None
+            return candidate
+
+        return None
+>>>>>>> Stashed changes
 
     def _invalidate_system_prompt(self):
         """Forwarder — see ``agent.system_prompt.invalidate_system_prompt``."""

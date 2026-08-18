@@ -331,6 +331,7 @@ class _ProviderCollector:
 
     def register_hook(self, *args, **kwargs):
         pass
+<<<<<<< Updated upstream
 
     def register_cli_command(self, *args, **kwargs):
         pass  # CLI registration happens via discover_plugin_cli_commands()
@@ -448,3 +449,5 @@ def discover_plugin_cli_commands() -> List[dict]:
         logger.debug("Failed to scan CLI for memory plugin '%s': %s", active_provider, e)
 
     return results
+=======
+>>>>>>> Stashed changes

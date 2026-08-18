@@ -12,8 +12,16 @@ import asyncio
 import logging
 import os
 import re
+import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
+
+# BaseExceptionGroup is a built-in in Python 3.11+; backport needed on 3.10.
+if sys.version_info < (3, 11):
+    try:
+        from exceptiongroup import BaseExceptionGroup  # noqa: F401
+    except ImportError:
+        BaseExceptionGroup = type("BaseExceptionGroup", (BaseException,), {})
 
 from hermes_cli.config import (
     cfg_get,

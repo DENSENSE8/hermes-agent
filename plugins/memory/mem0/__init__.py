@@ -1,14 +1,25 @@
-"""Mem0 memory plugin — MemoryProvider interface.
+"""Mem0 memory plugin — MemoryProvider interface (self-hosted + cloud).
 
-Server-side LLM fact extraction, semantic search with reranking, and
-automatic deduplication via the Mem0 Platform API.
+Local-first memory with LLM fact extraction, semantic search with reranking,
+and automatic deduplication. Supports both modes:
+  - Self-hosted: Qdrant + Ollama (default, no API key needed)
+  - Cloud: Mem0 Platform API (set MEM0_API_KEY)
 
-Original PR #2933 by kartik-mem0, adapted to MemoryProvider ABC.
+Original PR #2933 by kartik-mem0, adapted to MemoryProvider ABC,
+then extended for self-hosted mode (garisek-os).
 
 Config via environment variables:
-  MEM0_API_KEY       — Mem0 Platform API key (required)
-  MEM0_USER_ID       — User identifier (default: hermes-user)
-  MEM0_AGENT_ID      — Agent identifier (default: hermes)
+  MEM0_MODE           — 'local' (default) or 'cloud'
+  MEM0_API_KEY        — Mem0 Platform API key (cloud mode only)
+  MEM0_USER_ID        — User identifier (default: hermes-user)
+  MEM0_AGENT_ID       — Agent identifier (default: hermes)
+  MEM0_QDRANT_URL     — Qdrant URL (default: http://localhost:6333)
+  MEM0_QDRANT_API_KEY ��� Qdrant API key (optional)
+  MEM0_OLLAMA_URL     — Ollama URL (default: http://localhost:11434)
+  MEM0_LLM_MODEL      — LLM model for fact extraction (default: qwen3:8b)
+  MEM0_EMBED_MODEL    — Embedding model (default: snowflake-arctic-embed:m)
+  MEM0_EMBED_DIMS     — Embedding dimensions (default: 768)
+  MEM0_COLLECTION     — Qdrant collection name (default: mem0-memories)
 
 Or via $HERMES_HOME/mem0.json.
 """
@@ -20,15 +31,14 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any, Dict, List
+from urllib.parse import urlparse
 
 from agent.memory_provider import MemoryProvider
-from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-# Circuit breaker: after this many consecutive failures, pause API calls
-# for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
 _BREAKER_THRESHOLD = 5
 _BREAKER_COOLDOWN_SECS = 120
 
@@ -38,20 +48,24 @@ _BREAKER_COOLDOWN_SECS = 120
 # ---------------------------------------------------------------------------
 
 def _load_config() -> dict:
-    """Load config from env vars, with $HERMES_HOME/mem0.json overrides.
-
-    Environment variables provide defaults; mem0.json (if present) overrides
-    individual keys.  This avoids a silent failure when the JSON file exists
-    but is missing fields like ``api_key`` that the user set in ``.env``.
-    """
+    """Load config from env vars, with $HERMES_HOME/mem0.json overrides."""
     from hermes_constants import get_hermes_home
 
     config = {
+        "mode": os.environ.get("MEM0_MODE", "local"),
         "api_key": os.environ.get("MEM0_API_KEY", ""),
         "user_id": os.environ.get("MEM0_USER_ID", "hermes-user"),
         "agent_id": os.environ.get("MEM0_AGENT_ID", "hermes"),
         "rerank": True,
         "keyword_search": False,
+        # Local mode settings
+        "qdrant_url": os.environ.get("MEM0_QDRANT_URL", "http://localhost:6333"),
+        "qdrant_api_key": os.environ.get("MEM0_QDRANT_API_KEY", ""),
+        "ollama_url": os.environ.get("MEM0_OLLAMA_URL", "http://localhost:11434"),
+        "llm_model": os.environ.get("MEM0_LLM_MODEL", "qwen3:8b"),
+        "embed_model": os.environ.get("MEM0_EMBED_MODEL", "snowflake-arctic-embed:m"),
+        "embed_dims": int(os.environ.get("MEM0_EMBED_DIMS", "768")),
+        "collection": os.environ.get("MEM0_COLLECTION", "mem0-memories"),
     }
 
     config_path = get_hermes_home() / "mem0.json"
@@ -64,6 +78,42 @@ def _load_config() -> dict:
             pass
 
     return config
+
+
+def _build_local_mem0_config(cfg: dict) -> dict:
+    """Build mem0 Memory.from_config() dict for self-hosted Qdrant + Ollama."""
+    mem0_cfg = {
+        "version": "v1.1",
+        "vector_store": {
+            "provider": "qdrant",
+            "config": {
+                "url": cfg["qdrant_url"],
+                "collection_name": cfg["collection"],
+                "embedding_model_dims": cfg["embed_dims"],
+            },
+        },
+        "llm": {
+            "provider": "ollama",
+            "config": {
+                "model": cfg["llm_model"],
+                "ollama_base_url": cfg["ollama_url"],
+                "temperature": 0.2,
+            },
+        },
+        "embedder": {
+            "provider": "ollama",
+            "config": {
+                "model": cfg["embed_model"],
+                "ollama_base_url": cfg["ollama_url"],
+                "embedding_dims": cfg["embed_dims"],
+            },
+        },
+    }
+
+    if cfg.get("qdrant_api_key"):
+        mem0_cfg["vector_store"]["config"]["api_key"] = cfg["qdrant_api_key"]
+
+    return mem0_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -117,12 +167,13 @@ CONCLUDE_SCHEMA = {
 # ---------------------------------------------------------------------------
 
 class Mem0MemoryProvider(MemoryProvider):
-    """Mem0 Platform memory with server-side extraction and semantic search."""
+    """Mem0 memory — self-hosted (Qdrant + Ollama) or cloud."""
 
     def __init__(self):
         self._config = None
         self._client = None
         self._client_lock = threading.Lock()
+        self._mode = "local"
         self._api_key = ""
         self._user_id = "hermes-user"
         self._agent_id = "hermes"
@@ -131,7 +182,6 @@ class Mem0MemoryProvider(MemoryProvider):
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread = None
         self._sync_thread = None
-        # Circuit breaker state
         self._consecutive_failures = 0
         self._breaker_open_until = 0.0
 
@@ -141,12 +191,18 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def is_available(self) -> bool:
         cfg = _load_config()
-        return bool(cfg.get("api_key"))
+        mode = cfg.get("mode", "local")
+        if mode == "cloud":
+            return bool(cfg.get("api_key"))
+        # Local mode — available if mem0ai is installed
+        try:
+            import mem0  # noqa: F401
+            return True
+        except ImportError:
+            return False
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/mem0.json."""
-        import json
-        from pathlib import Path
         config_path = Path(hermes_home) / "mem0.json"
         existing = {}
         if config_path.exists():
@@ -160,30 +216,39 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def get_config_schema(self):
         return [
-            {"key": "api_key", "description": "Mem0 Platform API key", "secret": True, "required": True, "env_var": "MEM0_API_KEY", "url": "https://app.mem0.ai"},
+            {"key": "mode", "description": "Mode: 'local' (self-hosted) or 'cloud'", "default": "local", "choices": ["local", "cloud"]},
+            {"key": "api_key", "description": "Mem0 Platform API key (cloud mode only)", "secret": True, "required": False, "env_var": "MEM0_API_KEY"},
             {"key": "user_id", "description": "User identifier", "default": "hermes-user"},
             {"key": "agent_id", "description": "Agent identifier", "default": "hermes"},
+            {"key": "qdrant_url", "description": "Qdrant URL (local mode)", "default": "http://localhost:6333", "env_var": "MEM0_QDRANT_URL"},
+            {"key": "ollama_url", "description": "Ollama URL (local mode)", "default": "http://localhost:11434", "env_var": "MEM0_OLLAMA_URL"},
+            {"key": "llm_model", "description": "LLM for fact extraction", "default": "qwen3:8b", "env_var": "MEM0_LLM_MODEL"},
+            {"key": "embed_model", "description": "Embedding model", "default": "snowflake-arctic-embed:m", "env_var": "MEM0_EMBED_MODEL"},
             {"key": "rerank", "description": "Enable reranking for recall", "default": "true", "choices": ["true", "false"]},
         ]
 
     def _get_client(self):
-        """Thread-safe client accessor with lazy initialization."""
+        """Thread-safe client — local Memory or cloud MemoryClient."""
         with self._client_lock:
             if self._client is not None:
                 return self._client
             try:
-                from mem0 import MemoryClient
-                self._client = MemoryClient(api_key=self._api_key)
+                if self._mode == "cloud":
+                    from mem0 import MemoryClient
+                    self._client = MemoryClient(api_key=self._api_key)
+                else:
+                    from mem0 import Memory
+                    local_cfg = _build_local_mem0_config(self._config)
+                    self._client = Memory.from_config(local_cfg)
+                    logger.info("Mem0 local memory initialized (Qdrant + Ollama)")
                 return self._client
             except ImportError:
                 raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")
 
     def _is_breaker_open(self) -> bool:
-        """Return True if the circuit breaker is tripped (too many failures)."""
         if self._consecutive_failures < _BREAKER_THRESHOLD:
             return False
         if time.monotonic() >= self._breaker_open_until:
-            # Cooldown expired — reset and allow a retry
             self._consecutive_failures = 0
             return False
         return True
@@ -203,33 +268,16 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._config = _load_config()
+        self._mode = self._config.get("mode", "local")
         self._api_key = self._config.get("api_key", "")
-        # Prefer gateway-provided user_id for per-user memory scoping;
-        # fall back to config/env default for CLI (single-user) sessions.
-        self._user_id = kwargs.get("user_id") or self._config.get("user_id", "hermes-user")
+        self._user_id = self._config.get("user_id", "hermes-user")
         self._agent_id = self._config.get("agent_id", "hermes")
         self._rerank = self._config.get("rerank", True)
 
-    def _read_filters(self) -> Dict[str, Any]:
-        """Filters for search/get_all — scoped to user only for cross-session recall."""
-        return {"user_id": self._user_id}
-
-    def _write_filters(self) -> Dict[str, Any]:
-        """Filters for add — scoped to user + agent for attribution."""
-        return {"user_id": self._user_id, "agent_id": self._agent_id}
-
-    @staticmethod
-    def _unwrap_results(response: Any) -> list:
-        """Normalize Mem0 API response — v2 wraps results in {"results": [...]}."""
-        if isinstance(response, dict):
-            return response.get("results", [])
-        if isinstance(response, list):
-            return response
-        return []
-
     def system_prompt_block(self) -> str:
+        mode_label = "self-hosted" if self._mode == "local" else "cloud"
         return (
-            "# Mem0 Memory\n"
+            f"# Mem0 Memory ({mode_label})\n"
             f"Active. User: {self._user_id}.\n"
             "Use mem0_search to find memories, mem0_conclude to store facts, "
             "mem0_profile for a full overview."
@@ -252,14 +300,16 @@ class Mem0MemoryProvider(MemoryProvider):
         def _run():
             try:
                 client = self._get_client()
-                results = self._unwrap_results(client.search(
+                results = client.search(
                     query=query,
-                    filters=self._read_filters(),
+                    user_id=self._user_id,
                     rerank=self._rerank,
-                    top_k=5,
-                ))
+                    limit=5,
+                )
                 if results:
-                    lines = [r.get("memory", "") for r in results if r.get("memory")]
+                    # Local Memory returns dict with 'results' key; cloud returns list
+                    items = results if isinstance(results, list) else results.get("results", results)
+                    lines = [r.get("memory", "") for r in items if r.get("memory")]
                     with self._prefetch_lock:
                         self._prefetch_result = "\n".join(f"- {l}" for l in lines)
                 self._record_success()
@@ -271,7 +321,7 @@ class Mem0MemoryProvider(MemoryProvider):
         self._prefetch_thread.start()
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Send the turn to Mem0 for server-side fact extraction (non-blocking)."""
+        """Send the turn to Mem0 for fact extraction (non-blocking)."""
         if self._is_breaker_open():
             return
 
@@ -282,13 +332,12 @@ class Mem0MemoryProvider(MemoryProvider):
                     {"role": "user", "content": user_content},
                     {"role": "assistant", "content": assistant_content},
                 ]
-                client.add(messages, **self._write_filters())
+                client.add(messages, user_id=self._user_id, agent_id=self._agent_id)
                 self._record_success()
             except Exception as e:
                 self._record_failure()
                 logger.warning("Mem0 sync failed: %s", e)
 
-        # Wait for any previous sync before starting a new one
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
 
@@ -301,65 +350,67 @@ class Mem0MemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if self._is_breaker_open():
             return json.dumps({
-                "error": "Mem0 API temporarily unavailable (multiple consecutive failures). Will retry automatically."
+                "error": "Mem0 temporarily unavailable (circuit breaker). Will retry automatically."
             })
 
         try:
             client = self._get_client()
         except Exception as e:
-            return tool_error(str(e))
+            return json.dumps({"error": str(e)})
 
         if tool_name == "mem0_profile":
             try:
-                memories = self._unwrap_results(client.get_all(filters=self._read_filters()))
+                memories = client.get_all(user_id=self._user_id)
                 self._record_success()
-                if not memories:
+                # Local returns dict with 'results'; cloud returns list
+                items = memories if isinstance(memories, list) else memories.get("results", memories)
+                if not items:
                     return json.dumps({"result": "No memories stored yet."})
-                lines = [m.get("memory", "") for m in memories if m.get("memory")]
+                lines = [m.get("memory", "") for m in items if m.get("memory")]
                 return json.dumps({"result": "\n".join(lines), "count": len(lines)})
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Failed to fetch profile: {e}")
+                return json.dumps({"error": f"Failed to fetch profile: {e}"})
 
         elif tool_name == "mem0_search":
             query = args.get("query", "")
             if not query:
-                return tool_error("Missing required parameter: query")
+                return json.dumps({"error": "Missing required parameter: query"})
             rerank = args.get("rerank", False)
             top_k = min(int(args.get("top_k", 10)), 50)
             try:
-                results = self._unwrap_results(client.search(
-                    query=query,
-                    filters=self._read_filters(),
-                    rerank=rerank,
-                    top_k=top_k,
-                ))
+                results = client.search(
+                    query=query, user_id=self._user_id,
+                    rerank=rerank, limit=top_k,
+                )
                 self._record_success()
-                if not results:
+                items = results if isinstance(results, list) else results.get("results", results)
+                if not items:
                     return json.dumps({"result": "No relevant memories found."})
-                items = [{"memory": r.get("memory", ""), "score": r.get("score", 0)} for r in results]
-                return json.dumps({"results": items, "count": len(items)})
+                out = [{"memory": r.get("memory", ""), "score": r.get("score", 0)} for r in items]
+                return json.dumps({"results": out, "count": len(out)})
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Search failed: {e}")
+                return json.dumps({"error": f"Search failed: {e}"})
 
         elif tool_name == "mem0_conclude":
             conclusion = args.get("conclusion", "")
             if not conclusion:
-                return tool_error("Missing required parameter: conclusion")
+                return json.dumps({"error": "Missing required parameter: conclusion"})
             try:
                 client.add(
                     [{"role": "user", "content": conclusion}],
-                    **self._write_filters(),
+                    user_id=self._user_id,
+                    agent_id=self._agent_id,
                     infer=False,
                 )
                 self._record_success()
                 return json.dumps({"result": "Fact stored."})
             except Exception as e:
                 self._record_failure()
-                return tool_error(f"Failed to store: {e}")
+                return json.dumps({"error": f"Failed to store: {e}"})
 
-        return tool_error(f"Unknown tool: {tool_name}")
+        return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
     def shutdown(self) -> None:
         for t in (self._prefetch_thread, self._sync_thread):

@@ -26,16 +26,19 @@ Usage in run_agent.py:
 from __future__ import annotations
 
 import logging
+<<<<<<< Updated upstream
 import re
 import inspect
+=======
+>>>>>>> Stashed changes
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
-from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
 
+<<<<<<< Updated upstream
 # ---------------------------------------------------------------------------
 # Context fencing helpers
 # ---------------------------------------------------------------------------
@@ -241,6 +244,8 @@ def build_memory_context_block(raw_context: str) -> str:
     )
 
 
+=======
+>>>>>>> Stashed changes
 class MemoryManager:
     """Orchestrates the built-in provider plus at most one external provider.
 
@@ -448,7 +453,7 @@ class MemoryManager:
         """
         provider = self._tool_to_provider.get(tool_name)
         if provider is None:
-            return tool_error(f"No memory provider handles tool '{tool_name}'")
+            return json.dumps({"error": f"No memory provider handles tool '{tool_name}'"})
         try:
             return provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:
@@ -456,7 +461,7 @@ class MemoryManager:
                 "Memory provider '%s' handle_tool_call(%s) failed: %s",
                 provider.name, tool_name, e,
             )
-            return tool_error(f"Memory tool '{tool_name}' failed: {e}")
+            return json.dumps({"error": f"Memory tool '{tool_name}' failed: {e}"})
 
     # -- Lifecycle hooks -----------------------------------------------------
 

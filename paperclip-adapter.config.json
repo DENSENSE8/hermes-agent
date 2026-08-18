@@ -1,0 +1,75 @@
+{
+  "$schema": "https://raw.githubusercontent.com/NousResearch/hermes-paperclip-adapter/main/schema.json",
+  "name": "Hermes Memory Agent",
+  "adapterType": "hermes_local",
+  "description": "Unified Hermes memory agent — central memory router for nemoclaw, openclaw, paperclip, and sidecar sources",
+
+  "adapterConfig": {
+    "model": "ollama/qwen3:8b",
+    "provider": "ollama-local",
+    "maxIterations": 50,
+    "timeoutSec": 300,
+    "graceSec": 10,
+    "persistSession": true,
+    "worktreeMode": false,
+    "checkpoints": false,
+    "toolsets": "terminal,file,web,code,mcp",
+    "verbose": false,
+
+    "hermesCommand": "/home/avion/hermes-agent/venv/bin/python /home/avion/hermes-agent/run_agent.py",
+
+    "environment": {
+      "HONCHO_BASE_URL": "http://localhost:8800",
+      "HONCHO_ENVIRONMENT": "local",
+      "MEMORY_SIDECAR_URL": "http://localhost:8791",
+      "QDRANT_URL": "http://localhost:6333",
+      "QDRANT_API_KEY": "Qdrant_c319f28d45aedc9ca42b",
+      "OLLAMA_URL": "http://host.docker.internal:11434",
+      "EMBED_MODEL": "snowflake-arctic-embed:m",
+      "OPENAI_API_KEY": "ollama",
+      "OPENAI_BASE_URL": "http://host.docker.internal:11434/v1",
+      "HERMES_BRIDGE_URL": "http://localhost:8780",
+      "PAPERCLIP_MEMORY_MODE": "unified",
+      "PAPERCLIP_SOURCES": "nemoclaw,openclaw,paperclip,sidecar"
+    },
+
+    "promptTemplate": "You are {{agentName}}, a unified memory agent managing persistent context across all system sources: NemoClaw, OpenClaw, Paperclip, and the Memory Brain Sidecar.\n\n{{#taskId}}Task: {{taskTitle}}\nPriority: {{taskPriority}}\n{{/taskId}}\n\nYour memory backends:\n- Qdrant (hermes-memory, hermes-skills, agent-sessions) for vector similarity search\n- Honcho v3 for dialectic user modeling\n- Ollama snowflake-arctic-embed:m for embeddings\n\nAll interactions from any source are routed through the Memory Sidecar (:8791) and stored uniformly. You are the central memory authority for the entire Garisek-OS ecosystem."
+  },
+
+  "memorySources": {
+    "nemoclaw": {
+      "description": "NemoClaw fork — security wrapper + RAG pipeline + auto-triage",
+      "sidecarEndpoint": "http://localhost:8791/api/memory/save",
+      "sourceTag": "nemoclaw",
+      "collections": ["hermes-memory", "hermes-skills"],
+      "bridgeEndpoint": "http://localhost:8780/api/chat-log"
+    },
+    "openclaw": {
+      "description": "OpenClaw tooling — skills, hooks, apply_patch, process management",
+      "sidecarEndpoint": "http://localhost:8791/api/memory/save",
+      "sourceTag": "openclaw",
+      "collections": ["hermes-memory", "hermes-skills"],
+      "skillsDir": "~/.openclaw/skills/"
+    },
+    "paperclip": {
+      "description": "Paperclip orchestration — managed agent tasks and heartbeats",
+      "sidecarEndpoint": "http://localhost:8791/api/memory/save",
+      "sourceTag": "paperclip",
+      "collections": ["hermes-memory", "agent-sessions"],
+      "sessionPersist": true
+    },
+    "sidecar": {
+      "description": "Memory Brain Sidecar — unified API (Qdrant + Honcho + Ollama)",
+      "endpoint": "http://localhost:8791",
+      "collections": ["hermes-memory", "hermes-skills", "agent-sessions"],
+      "reflectionCron": "0 */6 * * *",
+      "reflectionScript": "/home/avion/nemoclaw-fork/scripts/memory-reflect.mjs"
+    }
+  },
+
+  "sessionCodec": {
+    "persistPath": "/home/avion/hermes-agent/.paperclip-sessions/",
+    "resumeFlag": "--resume",
+    "idPattern": "Session ID: ([a-f0-9-]+)"
+  }
+}
